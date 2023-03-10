@@ -18,7 +18,6 @@ import org.projectfloodlight.openflow.protocol.match.MatchField;
 import org.projectfloodlight.openflow.protocol.meterband.OFMeterBand;
 import org.projectfloodlight.openflow.protocol.meterband.OFMeterBandDrop;
 import org.projectfloodlight.openflow.types.*;
-import org.python.constantine.platform.IPProto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,7 +29,6 @@ import net.floodlightcontroller.core.module.FloodlightModuleContext;
 import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
 import net.floodlightcontroller.core.module.IFloodlightService;
-import net.floodlightcontroller.core.util.AppCookie;
 import net.floodlightcontroller.devicemanager.SwitchPort;
 import net.floodlightcontroller.statistics.IStatisticsService;
 import net.floodlightcontroller.statistics.SwitchPortBandwidth;
@@ -66,23 +64,24 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	public static final int WARNING_TO_LIMIT = 2; // defence状态下的流表项ID，用于将IP地址对从warning状态转变为limit状态
 	public static final int MALICIOUS_TO_DROP = 3; // defence状态下的流表项ID，用于将IP地址对从defence状态转变为drop状态
 
-	private int packetCount=0;
-
 	// Parameters
 	private static final int attackThreshold = 140;     // IP对出现次数的攻击阈值
 	private static final int normalThreshold = 120;     // IP对出现次数的正常阈值
 	private static final int attack = 10000;       // 流量阈值，单位kbit/s
 	private static final int Period = 2;                    // 链路流量检测线程的执行周期
-	private static final int CHECK_INTERVAL = 5000;         // Edge port traffic check interval in milliseconds
+	private static final int timeThreshold = 5000;         // Edge port traffic check interval in milliseconds
 	private static long MeterId = 0;              //计量表号，下发计量表时，初值需设为1
-	private static final long ratelimit = 5000;                  //计量表限速后的速率
+	private static final long rateLimit = 5000;                  //计量表限速后的速率
 	//private static final int TRAFFIC_THRESHOLD = attackThreshold / 1000; // Edge port traffic rate threshold in kbit/s
-	//private static final int CONSECUTIVE_COUNT_THRESHOLD = 10; // Number of consecutive checks before changing system status back to NORMAL
+	private static final int CONSECUTIVE_COUNT_THRESHOLD = 10; // Number of consecutive checks before changing system status back to NORMAL
 
 	// System status variables 0=normal,1=defence
 	private int status= 0;
-	private int consecutiveCount = 0;
-	private long lastCheckTime = System.currentTimeMillis();
+
+	private static final int COUNTER_THRESHOLD = 10;  // 计数器的阈值
+	private int packetCount = 0;  // 统计接收的数据包数目
+
+	private long lastUpdateTime = 0;
 
 
 
@@ -156,7 +155,11 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 					IPv4 ipv4 = (IPv4) eth.getPayload();
 					String srcIp = ipv4.getSourceAddress().toString();
 					String dstIp = ipv4.getDestinationAddress().toString();
-					IPAddressPair ipPair = new IPAddressPair(srcIp, dstIp);
+
+					IPv4Address srcIP = IPv4Address.of(srcIp);
+					IPv4Address dstIP = IPv4Address.of(dstIp);
+					IPAddressPair ipPair = new IPAddressPair(srcIP, dstIP);
+
 					logger.info("IPv4: Source IPv4 address:" + ipv4.getSourceAddress() + ",destination IPv4 address:" + ipv4.getDestinationAddress());
 
 					// 判断ipCountMap中是否已经存在了当前的ipPair，如果存在则将对应的计数加1，否则将计数设为1
@@ -189,27 +192,56 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	//
 	@Override
 	public void getSwitchPorts() {
-		Set<DatapathId> swid = new HashSet<DatapathId>(ofswitch.getAllSwitchDpids());
-		Set<SwitchPort> switchports = new HashSet<SwitchPort>();
-		for (DatapathId dpid : swid) {
-			Set<OFPort> ports = new HashSet<OFPort>(topology.getPorts(dpid));
-			for (OFPort port : ports) {
-				if (topology.isEdge(dpid, port)) {
-					SwitchPort switchPort = new SwitchPort(dpid, port);
-					switchports.add(switchPort);
+			Set<DatapathId> swid = new HashSet<DatapathId>(ofswitch.getAllSwitchDpids());
+			Set<SwitchPort> switchports = new HashSet<SwitchPort>();
 
-					// Check edge port traffic rate
-					long currentTime = System.currentTimeMillis();
-					long interval = currentTime - lastCheckTime;
-					if (interval >= CHECK_INTERVAL) {
-						lastCheckTime = currentTime;
+			for (DatapathId dpid : swid) {
+				Set<OFPort> ports = new HashSet<OFPort>(topology.getPorts(dpid));
+				for (OFPort port : ports) {
+					if (topology.isEdge(dpid, port)) {
+						SwitchPort switchPort = new SwitchPort(dpid, port);
+						switchports.add(switchPort);
 
-						IPAddressPair ipPair = new IPAddressPair(switchPort.getSwitchDPID(), switchPort.getPort());
-						classifyFlow(ipPair, trafficRate);
+						// 获取端口的发送流量速率和接收流量速率
+						SwitchPortBandwidth data = statistics.getBandwidthConsumption((DatapathId) swid, port);
+						if (data != null) {
+							long rxRate = data.getBitsPerSecondRx().getValue() / 1000;
+							long txRate = data.getBitsPerSecondTx().getValue() / 1000;
+
+							// 判断流量是否超过阈值
+							if (rxRate > attack && txRate > attack) {
+								packetCount++;
 					}
 				}
 			}
 		}
+	}
+		long currentTime = System.currentTimeMillis();
+		long elapsedTime = currentTime - lastUpdateTime;
+		// 根据超过阈值的端口数量和时间来更新系统状态
+		if (elapsedTime > timeThreshold) {
+			if (packetCount > 0) {
+				if (status == 0) {
+					// 如果系统之前处于正常状态，则记录当前时间，并将系统状态设置为防御状态
+					status = 1;
+				} else if (status == 1 && (currentTime - lastUpdateTime) > 10 * timeThreshold) {
+					// 如果系统之前已经处于防御状态，并且连续10个时间间隔内都没有超过流量阈值，则将系统状态设置为正常状态
+					status = 0;
+				}
+			} else {
+				// 如果没有端口的流量超过阈值，则将系统状态设置为正常状态
+				status = 0;
+			}
+			logger.info("Current system status: " + status);
+			lastUpdateTime = currentTime;
+		}
+		// 将获取到的端口列表保存到成员变量中
+		this.switchports = switchports;
+	}
+
+	@Override
+	public void getPortFlows() {
+
 	}
 
 	public void writeIPSetToFile(Set<IPAddressPair> ipSet, String fileName) {
@@ -261,7 +293,7 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	}
 
 	private void addFlow(IPAddressPair ipPair, int flowType) {
-		IOFSwitch sw = switchService.getActiveSwitch(ipPair.getSrcIP().getInt()); // get the source switch
+		IOFSwitch sw = switchService.getActiveSwitch(DatapathId.of(ipPair.getSrcIP().getInt())); // get the source switch
 		IPv4Address ipv4_src = ipPair.getSrcIP(); // get the source IP address
 		IPv4Address ipv4_dst = ipPair.getDstIP(); // get the destination IP address
 
@@ -324,47 +356,11 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 		writeIPSetToFile(maliciousIPSet, "maliciousIPSet.txt");
 	}
 
-	@Override
-	//给所有接收流量速率超过阈值的（边缘交换机，其边缘端口）下发计量表项和流表项
-	//正常-转发
-	//防御-小于-转发
-	//防御-大于-限速/禁止
-	public void getPortFlows() {
-		for(SwitchPort sp : switchports) {
-			SwitchPortBandwidth data = statistics.getBandwidthConsumption(sp.getNodeId(), sp.getPortId());
-			if(data != null) {
-				//端口接收流量和发送流量速率，单位为kbit/s
-				long RX = data.getBitsPerSecondRx().getValue()/1000;
-				long TX = data.getBitsPerSecondTx().getValue()/1000;
-				System.out.println("交换机" + sp.getNodeId() + "的" + sp.getPortId() + "端口接收流量:" + RX + "Kbit/s");
-				System.out.println("交换机" + sp.getNodeId() + "的" + sp.getPortId() + "端口发送流量:" + TX + "Kbit/s");
-				
-				//判断流表项是否已经下发
-				if(!addFlowHistory.contains(sp)) {
-					//如果大于rateLimit（5mb），且还是从3端口发的
-					if(RX >= ratelimit && sp.getPortId().equals(OFPort.of(3))) {
-						//h3对h4发送的UDP流量被限制在5mb
-						addMeter(ofswitch.getSwitch(sp.getNodeId()), (long)0);
-                        addFlow(ofswitch.getSwitch(sp.getNodeId()), IPv4Address.of("10.0.0.3"), IPv4Address.of("10.0.0.4"));
-						addFlowHistory.add(sp);
-					}
-					//如果大于MAX（15mb），且还是从2端口发的
-					if(RX >= MAX && sp.getPortId().equals(OFPort.of(2))) {
-						//下发meter表，将速度限制在0
-                        addMeter(ofswitch.getSwitch(sp.getNodeId()), speed);
-                        //下发指定该meter表的流表项
-						addMMFlow(ofswitch.getSwitch(sp.getNodeId()), IPv4Address.of("10.0.0.2"), IPv4Address.of("10.0.0.4"));
-						addFlowHistory.add(sp);
-					}
-				}
-			}
-		}
-	}
 
 	//具体限速实施细节
 	//限定在ratelimit
 	//
-	public static void limitmeter(IOFSwitch sw, Long rateLimit){
+	public static void limitMeter(IOFSwitch sw, Long rateLimit){
 		MeterId++;
 		logger.info("enter add limitmeter()");
 		//设置OpenFlow版本
@@ -402,6 +398,9 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	//流表项添加
 	public static void limitFlow(IOFSwitch sw, IPv4Address IPv4_SRC, IPv4Address IPv4_DST)
 	{
+		// 为指定地址添加限速
+		limitMeter(sw, rateLimit);
+
 		OFFlowMod.Builder fmb2 = sw.getOFFactory().buildFlowAdd();
 		//设置匹配域
 		Match.Builder mb2 = sw.getOFFactory().buildMatch();
