@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
+
 import net.floodlightcontroller.core.IFloodlightProviderService;
 import net.floodlightcontroller.packet.*;
 import net.floodlightcontroller.staticentry.IStaticEntryPusherService;
@@ -20,7 +21,7 @@ import org.projectfloodlight.openflow.protocol.meterband.OFMeterBandDrop;
 import org.projectfloodlight.openflow.types.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
+import org.projectfloodlight.openflow.protocol.OFFlowMod;
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IOFMessageListener;
 import net.floodlightcontroller.core.IOFSwitch;
@@ -37,8 +38,10 @@ import net.floodlightcontroller.topology.ITopologyService;
 
 import static net.floodlightcontroller.core.internal.Controller.switchService;
 
+import static net.floodlightcontroller.meter.utils.*;
+
 public class Metertest implements IOFMessageListener, IFloodlightModule, IMetertestService {
-	
+
 	protected static Logger logger;
 	protected ITopologyService topology;             //拓扑管理模块的接口
 	protected IThreadPoolService threadPoolService;  //线程池
@@ -46,8 +49,8 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	protected IStatisticsService statistics;         //统计模块的接口
 
 	protected IFloodlightProviderService floodlightProvider;
-	protected IStaticEntryPusherService staticEntryPusherService;
-	
+	protected static IStaticEntryPusherService staticEntryPusherService;
+
 	private static Set<DatapathId> swid;           //存储拓扑中的所有交换机id
 	private static Set<SwitchPort> switchports;    //存储交换机与主机相连的端口
 	private static Set<SwitchPort> addFlowHistory = new HashSet<SwitchPort>(); //记录下发过的流表项
@@ -55,15 +58,13 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	private Set<IPAddressPair> maliciousIPSet = new HashSet<>(); // 存储恶意IP地址对的集合
 	private Set<IPAddressPair> historyIPSet = new HashSet<>(); // 存储历史IP地址对的集合
 	private Set<IPAddressPair> warningIPSet = new HashSet<>(); // 存储预警IP地址对的集合
-
-
-	private Map<IPAddressPair, Integer> ipPairCounter = new HashMap<>(); //统计每个 IP 地址对出现的次数
+	//private Map<IPAddressPair, Integer> ipPairCounter = new HashMap<>(); //统计每个 IP 地址对出现的次数
 
 	public static final int NORMAL_TO_HISTORY = 0; // normal状态下的流表项ID，用于将IP地址对从normal状态转变为history状态
 	public static final int NORMAL_TO_DEFAULT = 1; // normal状态下的流表项ID，用于将IP地址对从normal状态转变为default状态
 	public static final int WARNING_TO_LIMIT = 2; // defence状态下的流表项ID，用于将IP地址对从warning状态转变为limit状态
 	public static final int MALICIOUS_TO_DROP = 3; // defence状态下的流表项ID，用于将IP地址对从defence状态转变为drop状态
-
+	//public static final int IP_COUNT_MAP_CLEAR_INTERVAL=90000;//15mins
 	// Parameters
 	private static final int attackThreshold = 140;     // IP对出现次数的攻击阈值
 	private static final int normalThreshold = 120;     // IP对出现次数的正常阈值
@@ -72,17 +73,15 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	private static final int timeThreshold = 5000;         // Edge port traffic check interval in milliseconds
 	private static long MeterId = 0;              //计量表号，下发计量表时，初值需设为1
 	private static final long rateLimit = 5000;                  //计量表限速后的速率
-	//private static final int TRAFFIC_THRESHOLD = attackThreshold / 1000; // Edge port traffic rate threshold in kbit/s
-	private static final int CONSECUTIVE_COUNT_THRESHOLD = 10; // Number of consecutive checks before changing system status back to NORMAL
 
-	// System status variables 0=normal,1=defence
-	private int status= 0;
+	private static int counter = 0; // 状态切换计数器，初始值为0
+
+	private int status = 0;// 0=normal,1=defence
 
 	private static final int COUNTER_THRESHOLD = 10;  // 计数器的阈值
-	private int packetCount = 0;  // 统计接收的数据包数目
+	private static int packetCount = 0;  // 统计接收的数据包数目
 
-	private long lastUpdateTime = 0;
-
+	//private long lastUpdateTime = 0;//打点记录时间，
 
 
 	@Override
@@ -106,35 +105,38 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	@Override
 	public Collection<Class<? extends IFloodlightService>> getModuleServices() {
 		Collection<Class<? extends IFloodlightService>> l = new ArrayList<Class<? extends IFloodlightService>>();
-        l.add(IMetertestService.class);
-        return l;
+		l.add(IMetertestService.class);
+		return l;
 	}
 
 	@Override
 	public Map<Class<? extends IFloodlightService>, IFloodlightService> getServiceImpls() {
 		Map<Class<? extends IFloodlightService>, IFloodlightService> m = new HashMap<Class<? extends IFloodlightService>, IFloodlightService>();
-        m.put(IMetertestService.class, this);
-        return m;
+		m.put(IMetertestService.class, this);
+		return m;
 	}
 
 	@Override
 	public Collection<Class<? extends IFloodlightService>> getModuleDependencies() {
 		Collection<Class<? extends IFloodlightService>> l = new ArrayList<Class<? extends IFloodlightService>>();
-        l.add(ITopologyService.class);
+		l.add(ITopologyService.class);
 		l.add(IOFSwitchService.class);
 		l.add(IStatisticsService.class);
 		l.add(IFloodlightProviderService.class);
+		l.add(IStaticEntryPusherService.class);
 		return l;
 	}
 
 	@Override
 	public void init(FloodlightModuleContext context) throws FloodlightModuleException {
+
 		topology = context.getServiceImpl(ITopologyService.class);
 		threadPoolService = context.getServiceImpl(IThreadPoolService.class);
 		ofswitch = context.getServiceImpl(IOFSwitchService.class);
 		statistics = context.getServiceImpl(IStatisticsService.class);
 		logger = LoggerFactory.getLogger(Metertest.class);
 		floodlightProvider = context.getServiceImpl(IFloodlightProviderService.class);
+		staticEntryPusherService = context.getServiceImpl(IStaticEntryPusherService.class);
 	}
 
 	@Override
@@ -145,7 +147,6 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 	}
 
 	//国际学院网络2001班匡子晗 学号202021190009
-
 	@Override
 	public Command receive(IOFSwitch sw, OFMessage msg, FloodlightContext cntx) {
 		switch (msg.getType()) {
@@ -162,10 +163,19 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 
 					logger.info("IPv4: Source IPv4 address:" + ipv4.getSourceAddress() + ",destination IPv4 address:" + ipv4.getDestinationAddress());
 
-					// 判断ipCountMap中是否已经存在了当前的ipPair，如果存在则将对应的计数加1，否则将计数设为1
-					int count = ipCountMap.containsKey(ipPair) ? ipCountMap.get(ipPair) + 1 : 1;
-					ipCountMap.put(ipPair, count);
-					classifyFlow(ipPair, count);
+/*					TimerTask clearTask = new TimerTask() {
+						@Override
+						public void run() {
+							ipCountMap.clear();
+							log.info("Clear ipCountMap");
+						}
+					};*/
+
+					int count = containsIPAddressPair(ipCountMap,ipPair) ? ipCountMap.get(ipPair) + 1 : 1;
+					//ipCountMap.put(ipPair, count);
+					putIPAddressPair(ipCountMap,ipPair,count);
+					System.out.println("ipPair：" + ipPair.getSrcIP() + "到" + ipPair.getDstIP() + "出现第" + count + "次");
+					classifyFlow(ipPair, count,sw);
 				}
 				packetCount++;
 				break;
@@ -174,74 +184,83 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 		}
 		return Command.CONTINUE;
 	}
-	
-	protected class GetInfo implements Runnable{
-		
+
+	protected class GetInfo implements Runnable {
+
 		public void run() {
 			System.out.println("Start!");
-			if(!ofswitch.getAllSwitchDpids().isEmpty()) {
+			if (!ofswitch.getAllSwitchDpids().isEmpty()) {
 				getSwitchPorts();
 				getPortFlows();
 			}
 		}
 	}
 
-	//获取边缘交换机
-	//得到边缘端口的接收速率和发送速率
-	//计算出现次数
-	//
 	@Override
+	//获得拓扑中所有（边缘交换机，其边缘端口）的集合
 	public void getSwitchPorts() {
-			Set<DatapathId> swid = new HashSet<DatapathId>(ofswitch.getAllSwitchDpids());
-			Set<SwitchPort> switchports = new HashSet<SwitchPort>();
-
-			for (DatapathId dpid : swid) {
-				Set<OFPort> ports = new HashSet<OFPort>(topology.getPorts(dpid));
-				for (OFPort port : ports) {
-					if (topology.isEdge(dpid, port)) {
-						SwitchPort switchPort = new SwitchPort(dpid, port);
-						switchports.add(switchPort);
-
-						// 获取端口的发送流量速率和接收流量速率
-						SwitchPortBandwidth data = statistics.getBandwidthConsumption((DatapathId) swid, port);
-						if (data != null) {
-							long rxRate = data.getBitsPerSecondRx().getValue() / 1000;
-							long txRate = data.getBitsPerSecondTx().getValue() / 1000;
-
-							// 判断流量是否超过阈值
-							if (rxRate > attack && txRate > attack) {
-								packetCount++;
-					}
+		//得到所有交换机id
+		swid = new HashSet<DatapathId>(ofswitch.getAllSwitchDpids());
+		switchports = new HashSet<SwitchPort>();
+		for (DatapathId dpid : swid) {
+			//得到每个交换机的所有端口
+			Set<OFPort> ports = new HashSet<OFPort>(topology.getPorts(dpid));
+			for (OFPort port : ports) {
+				//判断交换机端口是否是边缘端口(边缘端口为直接连接主机的端口)
+				if (topology.isEdge(dpid, port)) {
+					//加到边缘交换机的存储switchports里面去
+					switchports.add(new SwitchPort(dpid, port));
 				}
 			}
 		}
-	}
-		long currentTime = System.currentTimeMillis();
-		long elapsedTime = currentTime - lastUpdateTime;
-		// 根据超过阈值的端口数量和时间来更新系统状态
-		if (elapsedTime > timeThreshold) {
-			if (packetCount > 0) {
-				if (status == 0) {
-					// 如果系统之前处于正常状态，则记录当前时间，并将系统状态设置为防御状态
-					status = 1;
-				} else if (status == 1 && (currentTime - lastUpdateTime) > 10 * timeThreshold) {
-					// 如果系统之前已经处于防御状态，并且连续10个时间间隔内都没有超过流量阈值，则将系统状态设置为正常状态
-					status = 0;
-				}
-			} else {
-				// 如果没有端口的流量超过阈值，则将系统状态设置为正常状态
-				status = 0;
-			}
-			logger.info("Current system status: " + status);
-			lastUpdateTime = currentTime;
-		}
-		// 将获取到的端口列表保存到成员变量中
-		this.switchports = switchports;
 	}
 
 	@Override
+	//给所有接收流量速率超过阈值的（边缘交换机，其边缘端口）下发计量表项和流表项
 	public void getPortFlows() {
+/*		// 记录当前轮到的交换机编号，初始值为0
+		int currentSwitchIndex = 0;*/
 
+		// 记录每个交换机是否超过阈值的状态，初始值为false
+		boolean RXflag = false;
+		boolean TXflag = false;
+
+		for (SwitchPort sp : switchports) {
+			SwitchPortBandwidth data = statistics.getBandwidthConsumption(sp.getNodeId(), sp.getPortId());
+			if (data != null) {
+				//端口接收流量和发送流量速率，单位为kbit/s
+				long RX = data.getBitsPerSecondRx().getValue() / 1000;
+				long TX = data.getBitsPerSecondTx().getValue() / 1000;
+				System.out.println("交换机" + sp.getNodeId() + "的" + sp.getPortId() + "端口接收流量:" + RX + "Kbit/s");
+				System.out.println("交换机" + sp.getNodeId() + "的" + sp.getPortId() + "端口发送流量:" + TX + "Kbit/s");
+
+				// 判断流量是否超过阈值
+				//sw1的接收流量
+				if (RX > attack) {
+					RXflag = true;
+				}
+				//sw2的发送流量
+				if (TX > attack) {
+					TXflag = true;
+				}
+
+				// 判断流量是否超过阈值
+				if (TXflag && RXflag) {
+					//packetCount++;
+					//System.out.println("超过阈值" + packetCount + "次");
+					status = 1;
+					System.out.println("检测到超出阈值，将系统状态设置为 防御 状态");
+					counter = 0; // 重置计数器
+				} else {
+					if (counter > 10) {
+						// 如果系统之前已经处于防御状态，并且连续10个时间间隔内都没有超过流量阈值，则将系统状态设置为正常状态
+						status = 0;
+						System.out.println("系统状态为 正常 ");
+					}
+					counter++; // 计数器加1
+				}
+			}
+		}
 	}
 
 	public void writeIPSetToFile(Set<IPAddressPair> ipSet, String fileName) {
@@ -259,108 +278,115 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 		}
 	}
 
-
 	//情况分类
-	public void classifyFlow(IPAddressPair ipPair, int count) {
+	public void classifyFlow(IPAddressPair ipPair, int count, IOFSwitch sw) {
 		switch (status) {
 			//normal
 			case 0:
-				if (count > normalThreshold && !maliciousIPSet.contains(ipPair)) {
-					addFlow(ipPair, NORMAL_TO_HISTORY);
+				if (count > normalThreshold && !containsIPAddressPair(maliciousIPSet,ipPair)) {
+
+					addFlow(ipPair, NORMAL_TO_HISTORY,sw);
 				} else {
-					addFlow(ipPair, NORMAL_TO_DEFAULT);
+
+					addFlow(ipPair, NORMAL_TO_DEFAULT,sw);
 				}
 				break;
 
 			//defence
 			case 1:
 				if (count > attackThreshold) {
-					if (historyIPSet.contains(ipPair)) {
-						addFlow(ipPair, WARNING_TO_LIMIT);
+					if (containsIPAddressPair(historyIPSet,ipPair)) {
+
+						addFlow(ipPair, WARNING_TO_LIMIT,sw);
 					} else {
-						addFlow(ipPair, MALICIOUS_TO_DROP);
+
+						addFlow(ipPair, MALICIOUS_TO_DROP,sw);
 						maliciousIPSet.add(ipPair);
 					}
 				} else {
-					addFlow(ipPair, NORMAL_TO_DEFAULT);
+					//System.out.println("模式： NORMAL_TO_DEFAULT");
+					addFlow(ipPair, NORMAL_TO_DEFAULT,sw);
 				}
 				break;
 
 			default:
-				addFlow(ipPair, NORMAL_TO_DEFAULT);
+				//System.out.println("模式： NORMAL_TO_DEFAULT");
+				addFlow(ipPair, NORMAL_TO_DEFAULT,sw);
 				break;
 		}
 	}
 
-	private void addFlow(IPAddressPair ipPair, int flowType) {
-		IOFSwitch sw = switchService.getActiveSwitch(DatapathId.of(ipPair.getSrcIP().getInt())); // get the source switch
+	//原版contain不能用
+	private void addFlow(IPAddressPair ipPair, int flowType, IOFSwitch sw) {
+		//IOFSwitch sw = switchService.getActiveSwitch(DatapathId.of(ipPair.getSrcIP().getInt())); // get the source switch
 		IPv4Address ipv4_src = ipPair.getSrcIP(); // get the source IP address
 		IPv4Address ipv4_dst = ipPair.getDstIP(); // get the destination IP address
 
 		switch (flowType) {
 			case NORMAL_TO_HISTORY:
-				// add flow to move packets from normal table to history table
-				// e.g. staticEntryPusherService.addFlow(switch, inputPort, ipPair, NORMAL_TO_HISTORY);
-				if (ipPairCounter.containsKey(ipPair)) {
-					int count = ipPairCounter.get(ipPair);
-					if (count > normalThreshold && !maliciousIPSet.contains(ipPair)) {
-						ipPairCounter.put(ipPair, 0); // reset count to 0
+				if (containsIPAddressPair(ipCountMap,ipPair)){
+					//ipPairCounter.containsKey(ipPair)
+					System.out.println("模式：NORMAL_TO_HISTORY");
+					int count = ipCountMap.get(ipPair);
+					if (count > normalThreshold && !containsIPAddressPair(maliciousIPSet,ipPair)) {
+						putIPAddressPair(ipCountMap,ipPair,0);
+						//ipPairCounter.put(ipPair, 0); // reset count to 0
 						historyIPSet.add(ipPair); // add to history IP set
+						writeIPSetToFile(historyIPSet, "historyIPSet.txt");
 						logger.info("IP pair " + ipPair + " added to history IP set");
 					}
 				}
 				break;
 
 			case NORMAL_TO_DEFAULT:
-				if (ipPairCounter.containsKey(ipPair)) {
-					int count = ipPairCounter.get(ipPair);
-					if (count <= normalThreshold || maliciousIPSet.contains(ipPair)) {
-						ipPairCounter.put(ipPair, 0); // reset count to 0
+				if (containsIPAddressPair(ipCountMap,ipPair)) {
+					System.out.println("模式： NORMAL_TO_DEFAULT");
+					int count = ipCountMap.get(ipPair);
+					if (count <= normalThreshold || containsIPAddressPair(maliciousIPSet,ipPair)) {
+						putIPAddressPair(ipCountMap,ipPair,0); // reset count to 0
 						defaultFlow(sw, ipv4_dst); // forward using default flow
 					}
 				}
 				break;
 
 			case WARNING_TO_LIMIT:
-				// add flow to move packets from warning table to limit table
-				// e.g. staticEntryPusherService.addFlow(switch, inputPort, ipPair, WARNING_TO_LIMIT);
-				if (ipPairCounter.containsKey(ipPair)) {
-					int count = ipPairCounter.get(ipPair);
+				if (containsIPAddressPair(ipCountMap,ipPair)) {
+					System.out.println("模式： WARNING_TO_LIMIT");
+					int count = ipCountMap.get(ipPair);
 					if (count > attackThreshold) {
-						if (historyIPSet.contains(ipPair)) {
+						if (containsIPAddressPair(historyIPSet,ipPair)) {
 							warningIPSet.add(ipPair); // add to warning IP set
+							writeIPSetToFile(warningIPSet, "warningIPSet.txt");
 							logger.warn("IP pair " + ipPair + " added to warning IP set");
 							limitFlow(sw, ipv4_src, ipv4_dst);// apply rate limit using limit flow
 						} else {
 							maliciousIPSet.add(ipPair); // add to malicious IP set
+							writeIPSetToFile(maliciousIPSet, "maliciousIPSet.txt");
 							logger.warn("IP pair " + ipPair + " added to malicious IP set");
-							dropFlow(sw, ipv4_src, ipv4_dst); // drop using drop flow
+							dropFlow(sw); // drop using drop flow
 						}
-						ipPairCounter.put(ipPair, 0); // reset count to 0
+						//ipPairCounter.put(ipPair, 0); // reset count to 0
+						putIPAddressPair(ipCountMap,ipPair,0);
 					}
 				}
 				break;
 			case MALICIOUS_TO_DROP:
-				// add flow to drop packets from malicious IP pair
-				// e.g. staticEntryPusherService.addDropFlow(switch, inputPort, ipPair);
-				if (maliciousIPSet.contains(ipPair)) {
-					dropFlow(sw, ipv4_src, ipv4_dst); // drop using drop flow
+				if (containsIPAddressPair(maliciousIPSet,ipPair)) {
+					System.out.println("模式： MALICIOUS_TO_DROP");
+					dropFlow(sw); // drop using drop flow
 				}
 				break;
 			default:
 				break;
 		}
 		// write IP sets to log files
-		writeIPSetToFile(historyIPSet, "historyIPSet.txt");
-		writeIPSetToFile(warningIPSet, "warningIPSet.txt");
-		writeIPSetToFile(maliciousIPSet, "maliciousIPSet.txt");
 	}
 
 
 	//具体限速实施细节
 	//限定在ratelimit
 	//
-	public static void limitMeter(IOFSwitch sw, Long rateLimit){
+	public static void limitMeter(IOFSwitch sw, Long rateLimit) {
 		MeterId++;
 		logger.info("enter add limitmeter()");
 		//设置OpenFlow版本
@@ -370,34 +396,33 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 		flags.add(OFMeterFlags.KBPS);
 
 		//创建一个band
-		OFMeterBandDrop bandDrop = my13Factory.meterBands().buildDrop()														   
-														   .setRate(rateLimit)	// kbps
-														   .build();
-		
+		OFMeterBandDrop bandDrop = my13Factory.meterBands().buildDrop()
+				.setRate(rateLimit)    // kbps
+				.build();
+
 		logger.info("create band");
-		
+
 		//设置bands
 		List<OFMeterBand> bands = new ArrayList<OFMeterBand>();
-		bands.add(0,bandDrop);
+		bands.add(0, bandDrop);
 		logger.info("add band to bands");
-		
+
 		//创建一个Meter Modification Message发给交换机
 		OFMeterMod meterMod = my13Factory.buildMeterMod()
-										 .setMeterId(MeterId)
-										 .setCommand(OFMeterModCommand.ADD)
-										 .setFlags(flags)
-										 .setMeters(bands)									
-										 .build();
+				.setMeterId(MeterId)
+				.setCommand(OFMeterModCommand.ADD)
+				.setFlags(flags)
+				.setMeters(bands)
+				.build();
 		logger.info("create meterMod msg");
-	
+
 		sw.write(meterMod);
 		logger.info("add meter" + MeterId + " to meter table");
 	}
 
 	//在预警数据流中的地址进行限速
 	//流表项添加
-	public static void limitFlow(IOFSwitch sw, IPv4Address IPv4_SRC, IPv4Address IPv4_DST)
-	{
+	public static void limitFlow(IOFSwitch sw, IPv4Address IPv4_SRC, IPv4Address IPv4_DST) {
 		// 为指定地址添加限速
 		limitMeter(sw, rateLimit);
 
@@ -414,92 +439,69 @@ public class Metertest implements IOFMessageListener, IFloodlightModule, IMetert
 				.setIdleTimeout(0)
 				.setPriority(5)
 				.setMatch(mb2.build());
-		if(sw.write(fmb2.build())) {
+		if (sw.write(fmb2.build())) {
 			logger.info("add limitflow entry success");
-		}
-		else {
+		} else {
 			logger.info("add limitflow entry failed");
 		}
 	}
 
 	//正常情况下，默认转发
-	public static void defaultFlow(IOFSwitch sw, IPv4Address IPv4_DST){
+	public static void defaultFlow(IOFSwitch sw, IPv4Address IPv4_DST) {
 		OFFlowMod.Builder fmb = sw.getOFFactory().buildFlowAdd();
 		//匹配域
 		Match.Builder mb = sw.getOFFactory().buildMatch();
 		mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
 				.setExact(MatchField.IPV4_DST, IPv4_DST);
 
-        //指令与动作
+		//指令与动作
 		OFFactory myOF13Factory = OFFactories.getFactory(OFVersion.OF_13);
-        List<OFAction> actions = new ArrayList<OFAction>();
-        List<OFInstruction> instructions = new ArrayList<OFInstruction>();
+		List<OFAction> actions = new ArrayList<OFAction>();
+		List<OFInstruction> instructions = new ArrayList<OFInstruction>();
 
 		OFInstructionMeter meter = myOF13Factory.instructions().buildMeter()
-                .setMeterId(MeterId)
-                .build();
+				.setMeterId(MeterId)
+				.build();
 
 		OFAction output = myOF13Factory.actions().buildOutput()
 				//对于.setPort(OFPort.of(2))，是从2端口转出去，但实际要根据topo情况不同而改变
 				//controller是交给控制器处理
-        		    .setPort(OFPort.CONTROLLER)
-        		    .build();
+				.setPort(OFPort.CONTROLLER)
+				.build();
 		actions.add(output);
-		instructions.add((OFInstruction) myOF13Factory.instructions().applyActions(actions)) ;
+		instructions.add((OFInstruction) myOF13Factory.instructions().applyActions(actions));
 
-        //流表项
-        fmb.setHardTimeout(0)
+		//流表项
+		fmb.setHardTimeout(0)
 				.setIdleTimeout(0)
-                .setPriority(5)
-                .setMatch(mb.build());
-        fmb.setInstructions(instructions);
-       
-        if(sw.write(fmb.build())) {
-              logger.info("add defaultFlow entry success");
-          }
-          else {
-              logger.info("add defaultFlow entry failed");
-          }
+				.setPriority(5)
+				.setMatch(mb.build());
+		fmb.setInstructions(instructions);
+
+		if (sw.write(fmb.build())) {
+			logger.info("add defaultFlow entry success");
+		} else {
+			logger.info("add defaultFlow entry failed");
+		}
 	}
 
 	//在恶意数据流中的地址直接丢弃
-	public static void dropFlow(IOFSwitch sw, IPv4Address IPv4_SRC, IPv4Address IPv4_DST)
-	{
-		OFFlowMod.Builder fmb1 = sw.getOFFactory().buildFlowAdd();
-		//匹配域
-		Match.Builder mb1 = sw.getOFFactory().buildMatch();
-		mb1.setExact(MatchField.ETH_TYPE, EthType.IPv4)
-			.setExact(MatchField.IPV4_SRC, IPv4_SRC)
-				.setExact(MatchField.IPV4_DST, IPv4_DST)
-				.setExact(MatchField.IP_PROTO, IpProtocol.UDP);
-
-		//指令与动作
-		OFFactory myOF13Factory1 = OFFactories.getFactory(OFVersion.OF_13);
-		List<OFAction> actions = new ArrayList<OFAction>();
-		List<OFInstruction> instructions = new ArrayList<OFInstruction>();
-
-		OFInstructionMeter meter = myOF13Factory1.instructions().buildMeter()
-				.setMeterId(MeterId)
+	public static void dropFlow(IOFSwitch sw) {
+		OFFactory ofFactory = sw.getOFFactory();
+		Match match = ofFactory.buildMatch()
+				.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+				.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
+				//.setExact(MatchField.UDP_DST, TransportPort.of(8080))
 				.build();
-		instructions.add(meter);
-
-		OFAction output = myOF13Factory1.actions().buildOutput().build();
-		actions.add(output);
-
-		instructions.add((OFInstruction) myOF13Factory1.instructions().applyActions(actions)) ;
-
-		//流表项
-		fmb1.setHardTimeout(0)
-				.setIdleTimeout(0)
+		OFFlowAdd flowDelete = ofFactory.buildFlowAdd()
 				.setPriority(5)
-				.setMatch(mb1.build());
-		fmb1.setInstructions(instructions);
-
-		if(sw.write(fmb1.build())) {
-			logger.info("dd dropFlow success");
-		}
-		else {
-			logger.info("MM:add dropFlow failed");
-		}
+				.setIdleTimeout(0)
+				.setHardTimeout(0)
+				//.setOutPort(OFPort.of(1))
+				.setMatch(match)
+				.build();
+		staticEntryPusherService.addFlow("flow" + packetCount, flowDelete, sw.getId());
+		System.out.println("Drop rule installed on switch " + sw.getId());
+		//staticEntryPusherService.addFlow("flow" + packetCount, flowAdd, sw.getId());
 	}
 }

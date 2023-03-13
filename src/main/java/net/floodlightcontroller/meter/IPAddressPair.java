@@ -22,14 +22,22 @@ public class IPAddressPair {
         return dstIP;
     }
 
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        IPAddressPair that = (IPAddressPair) o;
-        return Objects.equals(srcIP, that.srcIP) &&
-                Objects.equals(dstIP, that.dstIP);
+    public boolean equals(IPAddressPair x) {
+        if (x == null) {
+            return false;
+        }
+        if (this == x) {
+            return true;
+        }
+        if (!this.srcIP.equals(x.srcIP)) {
+            return false;
+        }
+        if (!this.dstIP.equals(x.dstIP)) {
+            return false;
+        }
+        return true;
     }
+
 
     @Override
     public int hashCode() {
